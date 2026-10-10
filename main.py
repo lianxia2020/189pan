@@ -20,6 +20,7 @@ API_URL  = "https://api.cloud.189.cn"
 APP_ID   = "8025431004"
 RETURN_URL = "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html"
 TIMEOUT  = (15, 20)
+ACCOUNT_TYPE = "01"   # ★ 关键：PC 登录入口用 01
 DEBUG = os.getenv("DEBUG", "").lower() == "true"
 # ================================================
 
@@ -34,7 +35,6 @@ def debug(msg):
 
 
 def rsa_encrypt_raw(pubkey_b64, plaintext):
-    """标准 RSA 公钥加密，返回密文字节（不做任何编码转换）"""
     pem = f"-----BEGIN PUBLIC KEY-----\n{pubkey_b64}\n-----END PUBLIC KEY-----"
     pubkey = rsa.PublicKey.load_pkcs1_openssl_pem(pem.encode())
     max_len = pubkey.n.bit_length() // 8 - 11
@@ -43,14 +43,7 @@ def rsa_encrypt_raw(pubkey_b64, plaintext):
 
 
 def encode_for_login(pubkey_b64, pre, value):
-    """
-    189 登录加密约定：
-    - pre 前缀原样 hex 拼到密文 hex 前
-    - 明文先做 URL-safe 的 base64（189 用 urlsafe_b64encode 变种），再 RSA
-    返回纯 hex 字符串，与 189 前端一致。
-    """
     head = (pre or "").encode().hex()
-    # 189 用的是 urlsafe base64（无填充），不是标准 base64
     b64 = base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
     cipher = rsa_encrypt_raw(pubkey_b64, b64.encode())
     return head + cipher.hex()
@@ -80,7 +73,6 @@ def login(username, password):
     })
     debug("登录开始")
 
-    # ---------- Step 1 ----------
     r = s.get(WEB_URL + "/api/portal/unifyLoginForPC.action", params={
         "appId": APP_ID, "clientType": "10020", "returnURL": RETURN_URL,
         "timeStamp": str(int(time.time() * 1000)),
@@ -104,7 +96,6 @@ def login(username, password):
         fields[name] = m.group(1)
         debug(f"  {name} = {fields[name][:20]}...")
 
-    # ---------- Step 2 ----------
     conf = _json(s.post(AUTH_URL + "/api/logbox/config/encryptConf.do",
                         data={"appId": APP_ID}, timeout=TIMEOUT), "加密配置")
     debug(f"Step2 响应: {json.dumps(conf, ensure_ascii=False)[:400]}")
@@ -120,11 +111,7 @@ def login(username, password):
     if not isinstance(pubkey, str) or not pubkey:
         raise LoginError(f"pubKey 异常：type={type(pubkey).__name__}")
 
-    # ★ 打印 URL-safe base64 后的原文，便于比对
-    import base64 as _b64
-    def _peek(v):
-        return _b64.urlsafe_b64encode(v.encode()).rstrip(b"=").decode()
-    debug(f"Step2 手机号b64={_peek(username)} 密码b64={_peek(password[:4]+'***')}")
+    debug(f"Step2 手机号b64={base64.urlsafe_b64encode(username.encode()).rstrip(b'=').decode()}")
 
     try:
         eu = encode_for_login(pubkey, pre, username)
@@ -132,23 +119,25 @@ def login(username, password):
     except Exception as e:
         raise LoginError(f"RSA 加密失败：{type(e).__name__}: {e}")
     debug(f"Step2 eu前缀hex={eu[:12]!r} eu长度={len(eu)} ep长度={len(ep)}")
-    debug(f"Step2 eu前64={eu[:64]!r}")   # 密文主体，便于服务端比对
 
-    h = {"Referer": AUTH_URL + "/", "lt": fields["lt"], "REQID": fields["reqId"]}
+    h = {
+        "Referer": AUTH_URL + "/", "Origin": AUTH_URL,
+        "lt": fields["lt"], "REQID": fields["reqId"],
+        "Accept": "application/json;charset=UTF-8",
+    }
 
-    # ---------- Step 3 ----------
     rc = s.post(AUTH_URL + "/api/logbox/oauth2/needcaptcha.do", headers=h, data={
-        "appKey": APP_ID, "accountType": "02", "userName": eu}, timeout=TIMEOUT)
+        "appKey": APP_ID, "accountType": ACCOUNT_TYPE, "userName": eu}, timeout=TIMEOUT)
     debug(f"Step3 状态码={rc.status_code} body={rc.text.strip()!r}")
     if rc.status_code != 200 or rc.text.strip() != "0":
         raise LoginError(f"验证码检查异常：HTTP {rc.status_code}, body={rc.text[:120]!r}")
 
-    # ---------- Step 4 ----------
     r4 = s.post(AUTH_URL + "/api/logbox/oauth2/loginSubmit.do", headers=h, data={
-        "appKey": APP_ID, "accountType": "02", "userName": eu, "password": ep,
+        "appKey": APP_ID, "accountType": ACCOUNT_TYPE, "userName": eu, "password": ep,
         "validateCode": "", "captchaToken": fields["captchaToken"], "dynamicCheck": "FALSE",
         "clientType": "1", "cb_SaveName": "3", "isOauth2": "false",
         "returnUrl": RETURN_URL, "paramId": fields["paramId"],
+        "province": "", "rnd": str(int(time.time() * 1000)),
     }, timeout=TIMEOUT)
     debug(f"Step4 状态码={r4.status_code} 响应前400={r4.text[:400]!r}")
     d = _json(r4, "密码登录")
@@ -156,7 +145,6 @@ def login(username, password):
     if d.get("result") not in (0, "0") or not d.get("toUrl"):
         raise LoginError(f"登录被拒绝（{d.get('result')}）：{str(d.get('msg', ''))[:120]}")
 
-    # ---------- Step 5 ----------
     r5 = s.get(API_URL + "/getSessionForPC.action", params={
         "appId": APP_ID, "clientType": "TELEPC", "version": "6.2",
         "channelId": "web_cloud.189.cn", "rand": str(int(time.time() * 1000)),
