@@ -37,5 +37,5 @@ jobs:
           TYYP_USERNAME: ${{ secrets.TYYP_USERNAME }}
           TYYP_PSW: ${{ secrets.TYYP_PSW }}
           QYWX_KEY: ${{ secrets.QYWX_KEY }}
-          DEBUG: ${{ vars.DEBUG || 'false' }}
+          DEBUG: ${{ vars.DEBUG || 'true' }}
         run: python3 main.py
