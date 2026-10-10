@@ -1,3 +1,8 @@
+"""
+天翼云盘自动签到 + 抽奖（GitHub Actions 版）
+企微推送：text 纯文本
+Secrets：TYYP_USERNAME（& 分隔多账号）TYYP_PSW（顺序对应）QYWX_KEY（webhook 的 key 值）
+"""
 import time
 import re
 import os
@@ -79,7 +84,6 @@ def _json(r, stage):
     try:
         return r.json()
     except ValueError:
-        # 打印前 300 字帮助定位（登录页是 HTML 时会走这里）
         raise LoginError(f"{stage}：响应非 JSON，前300字：{r.text[:300]}")
 
 
@@ -124,7 +128,6 @@ def login(username, password):
     debug(f"Step2 响应: {json.dumps(conf, ensure_ascii=False)[:400]}")
 
     enc = conf.get("data") if isinstance(conf.get("data"), dict) else {}
-    # conf 本身可能就是 data 层，兜底
     if not enc:
         enc = conf
 
@@ -137,8 +140,7 @@ def login(username, password):
     if not isinstance(pubkey, str) or not pubkey:
         raise LoginError(f"pubKey 异常：type={type(pubkey).__name__}")
     if not isinstance(pre, str):
-        # pre 缺失时不少版本其实也能登录，降级为空串并告警
-        debug(f"pre 非字符串({type(pre).__name__})，降级为空串")
+        debug("pre 非字符串，降级为空串")
         pre = ""
 
     try:
@@ -146,37 +148,41 @@ def login(username, password):
         ep = pre + rsa_encode(pubkey, password)
     except Exception as e:
         raise LoginError(f"RSA 加密失败：{type(e).__name__}: {e}")
-    debug(f"Step2 加密后 userName 长度={len(eu)} password 长度={len(ep)}")
+    debug(f"Step2 加密完成 userName长度={len(eu)} password长度={len(ep)}")
 
     h = {"Referer": AUTH_URL + "/", "lt": fields["lt"], "REQID": fields["reqId"]}
 
     # ---------- Step 3：验证码检查 ----------
     rc = s.post(AUTH_URL + "/api/logbox/oauth2/needcaptcha.do", headers=h, data={
         "appKey": APP_ID, "accountType": "02", "userName": eu}, timeout=TIMEOUT)
-    debug(f"Step3 验证码检查 body={rc.text.strip()!r}")
+    debug(f"Step3 状态码={rc.status_code} body={rc.text.strip()!r}")   # ★ 先看真实返回
     if rc.status_code != 200 or rc.text.strip() != "0":
-        raise LoginError("需要验证码或检查异常")
+        # ★ 只抛一次，且带完整信息
+        raise LoginError(f"验证码检查异常：HTTP {rc.status_code}, body={rc.text[:120]!r}")
 
     # ---------- Step 4：登录提交 ----------
-    d = _json(s.post(AUTH_URL + "/api/logbox/oauth2/loginSubmit.do", headers=h, data={
+    r4 = s.post(AUTH_URL + "/api/logbox/oauth2/loginSubmit.do", headers=h, data={
         "appKey": APP_ID, "accountType": "02", "userName": eu, "password": ep,
         "validateCode": "", "captchaToken": fields["captchaToken"], "dynamicCheck": "FALSE",
         "clientType": "1", "cb_SaveName": "3", "isOauth2": "false",
         "returnUrl": RETURN_URL, "paramId": fields["paramId"],
-    }, timeout=TIMEOUT), "密码登录")
+    }, timeout=TIMEOUT)
+    debug(f"Step4 状态码={r4.status_code} 响应前400={r4.text[:400]!r}")
+    d = _json(r4, "密码登录")
     debug(f"Step4 result={d.get('result')} 有toUrl={'toUrl' in d}")
     if d.get("result") not in (0, "0") or not d.get("toUrl"):
         raise LoginError(f"登录被拒绝（{d.get('result')}）：{str(d.get('msg', ''))[:120]}")
 
     # ---------- Step 5：换取 PC 会话（XML）----------
-    r = s.get(API_URL + "/getSessionForPC.action", params={
+    r5 = s.get(API_URL + "/getSessionForPC.action", params={
         "appId": APP_ID, "clientType": "TELEPC", "version": "6.2",
         "channelId": "web_cloud.189.cn", "rand": str(int(time.time() * 1000)),
         "redirectURL": d["toUrl"],
     }, timeout=TIMEOUT, allow_redirects=True)
-    m = re.search(r"<sessionKey>([^<]+)</sessionKey>", r.text)
+    debug(f"Step5 状态码={r5.status_code} 响应前200={r5.text[:200]!r}")
+    m = re.search(r"<sessionKey>([^<]+)</sessionKey>", r5.text)
     if not m:
-        raise LoginError(f"未取到 sessionKey，响应前300字：{r.text[:300]}")
+        raise LoginError(f"未取到 sessionKey，响应前300字：{r5.text[:300]}")
     s.cloud189_session_key = m.group(1)
     debug(f"Step5 sessionKey={s.cloud189_session_key[:16]}...")
     return s
@@ -196,7 +202,7 @@ def do_checkin(s):
         else:
             r.update(status="already_signed", signin="今日已签到，本次未重复领取")
     except Exception as e:
-        r["error"] = f"签到失败：{type(e).__name__}"
+        r["error"] = f"签到失败：{type(e).__name__}: {e}"
     return r
 
 
@@ -243,7 +249,6 @@ def load_accounts():
 
 
 def wecom_url(key):
-    """QYWX_KEY 可以是纯 key，也可以是完整 URL"""
     key = (key or "").strip()
     if not key:
         return None
@@ -253,7 +258,6 @@ def wecom_url(key):
 
 
 def push_wecom(webhook, content):
-    """text 纯文本推送，避免 markdown 被渲染成链接"""
     if not webhook:
         log("企业微信 webhook 未配置，跳过推送")
         return
@@ -293,7 +297,7 @@ def main():
             for j, d in enumerate(draws, 1):
                 log(f"  抽奖{j} [{d['task']}]：{d['msg']}")
         except Exception as e:
-            out["signin"] = f"登录失败：{type(e).__name__}"
+            out["signin"] = f"登录失败：{type(e).__name__}: {e}"
             log(f"  {out['signin']}")
         finally:
             if s:
