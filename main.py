@@ -53,9 +53,9 @@ def rsa_encode_with_prefix(pubkey_b64, prefix, string):
     189 的 pre 前缀约定：NRP 加密时前缀为 'NRP'（去掉花括号），
     把前缀 hex 拼到密文 hex 前面。
     """
-    raw = prefix.strip("{}") if prefix else ""
-    if raw:
-        return raw.encode().hex() + rsa_encode(pubkey_b64, string)
+    head = (prefix or "").encode().hex()
+    if head:
+        return head + rsa_encode(pubkey_b64, string)
     return rsa_encode(pubkey_b64, string)
 
 
