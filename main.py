@@ -1,12 +1,7 @@
-"""
-Secrets：
-  TYYP_USERNAME  手机号，多账号用 & 分隔
-  TYYP_PSW       密码，多账号用 & 分隔，顺序与用户名对应
-  QYWX_KEY       企业微信群机器人 webhook 里的 key 值
-"""
 import time
 import re
 import os
+import json
 import random
 import base64
 import rsa
@@ -21,10 +16,12 @@ DRAW_TASKS = [
 ]
 BI_RM = list("0123456789abcdefghijklmnopqrstuvwxyz")
 B64MAP = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-WEB_URL, AUTH_URL, API_URL = "https://cloud.189.cn", "https://open.e.189.cn", "https://api.cloud.189.cn"
-APP_ID = "8025431004"
+WEB_URL  = "https://cloud.189.cn"
+AUTH_URL = "https://open.e.189.cn"
+API_URL  = "https://api.cloud.189.cn"
+APP_ID   = "8025431004"
 RETURN_URL = "https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html"
-TIMEOUT = (15, 20)
+TIMEOUT  = (15, 20)
 DEBUG = os.getenv("DEBUG", "").lower() == "true"
 # ================================================
 
@@ -82,7 +79,8 @@ def _json(r, stage):
     try:
         return r.json()
     except ValueError:
-        raise LoginError(f"{stage}：响应非 JSON")
+        # 打印前 300 字帮助定位（登录页是 HTML 时会走这里）
+        raise LoginError(f"{stage}：响应非 JSON，前300字：{r.text[:300]}")
 
 
 def login(username, password):
@@ -94,13 +92,19 @@ def login(username, password):
                       "(KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36",
         "Accept": "*/*",
     })
+    debug("登录开始")
 
+    # ---------- Step 1：PC 登录页（302 → unifyAccountLogin.do）----------
     r = s.get(WEB_URL + "/api/portal/unifyLoginForPC.action", params={
         "appId": APP_ID, "clientType": "10020", "returnURL": RETURN_URL,
         "timeStamp": str(int(time.time() * 1000)),
     }, timeout=TIMEOUT, allow_redirects=True)
-    if r.status_code != 200 or "unifyAccountLogin" not in r.url:
-        raise LoginError(f"登录页异常，落点={r.url[:80]}")
+    debug(f"Step1 状态码={r.status_code} 最终URL={r.url[:100]}")
+    if r.status_code != 200:
+        raise LoginError(f"登录页 HTTP {r.status_code}")
+    if "unifyAccountLogin" not in r.url:
+        raise LoginError(f"登录页未跳转，落点={r.url[:100]}")
+
     fields, patterns = {}, {
         "captchaToken": r"['\"]captchaToken['\"]\s+value=['\"]([^'\"]+)['\"]",
         "lt":           r"\blt\s*=\s*['\"]([^'\"]+)['\"]",
@@ -110,32 +114,61 @@ def login(username, password):
     for name, pat in patterns.items():
         m = re.search(pat, r.text)
         if not m:
-            raise LoginError(f"登录页缺少字段：{name}")
+            raise LoginError(f"登录页缺少字段[{name}]")
         fields[name] = m.group(1)
+        debug(f"  {name} = {fields[name][:20]}...")
 
+    # ---------- Step 2：加密配置 ----------
     conf = _json(s.post(AUTH_URL + "/api/logbox/config/encryptConf.do",
                         data={"appId": APP_ID}, timeout=TIMEOUT), "加密配置")
-    enc = conf.get("data") or {}
-    if conf.get("result") not in (0, "0") or not enc.get("pubKey") or not enc.get("pre"):
-        raise LoginError("加密配置缺少公钥或前缀")
-    eu = enc["pre"] + rsa_encode(enc["pubKey"], username)
-    ep = enc["pre"] + rsa_encode(enc["pubKey"], password)
+    debug(f"Step2 响应: {json.dumps(conf, ensure_ascii=False)[:400]}")
+
+    enc = conf.get("data") if isinstance(conf.get("data"), dict) else {}
+    # conf 本身可能就是 data 层，兜底
+    if not enc:
+        enc = conf
+
+    debug(f"Step2 enc类型={type(enc).__name__} keys={list(enc.keys()) if isinstance(enc, dict) else 'N/A'}")
+
+    pubkey = enc.get("pubKey")
+    pre = enc.get("pre")
+    debug(f"Step2 pubKey存在={'Y' if pubkey else 'N'} pre={repr(pre)[:60]}")
+
+    if not isinstance(pubkey, str) or not pubkey:
+        raise LoginError(f"pubKey 异常：type={type(pubkey).__name__}")
+    if not isinstance(pre, str):
+        # pre 缺失时不少版本其实也能登录，降级为空串并告警
+        debug(f"pre 非字符串({type(pre).__name__})，降级为空串")
+        pre = ""
+
+    try:
+        eu = pre + rsa_encode(pubkey, username)
+        ep = pre + rsa_encode(pubkey, password)
+    except Exception as e:
+        raise LoginError(f"RSA 加密失败：{type(e).__name__}: {e}")
+    debug(f"Step2 加密后 userName 长度={len(eu)} password 长度={len(ep)}")
+
     h = {"Referer": AUTH_URL + "/", "lt": fields["lt"], "REQID": fields["reqId"]}
 
+    # ---------- Step 3：验证码检查 ----------
     rc = s.post(AUTH_URL + "/api/logbox/oauth2/needcaptcha.do", headers=h, data={
         "appKey": APP_ID, "accountType": "02", "userName": eu}, timeout=TIMEOUT)
+    debug(f"Step3 验证码检查 body={rc.text.strip()!r}")
     if rc.status_code != 200 or rc.text.strip() != "0":
         raise LoginError("需要验证码或检查异常")
 
+    # ---------- Step 4：登录提交 ----------
     d = _json(s.post(AUTH_URL + "/api/logbox/oauth2/loginSubmit.do", headers=h, data={
         "appKey": APP_ID, "accountType": "02", "userName": eu, "password": ep,
         "validateCode": "", "captchaToken": fields["captchaToken"], "dynamicCheck": "FALSE",
         "clientType": "1", "cb_SaveName": "3", "isOauth2": "false",
         "returnUrl": RETURN_URL, "paramId": fields["paramId"],
     }, timeout=TIMEOUT), "密码登录")
+    debug(f"Step4 result={d.get('result')} 有toUrl={'toUrl' in d}")
     if d.get("result") not in (0, "0") or not d.get("toUrl"):
         raise LoginError(f"登录被拒绝（{d.get('result')}）：{str(d.get('msg', ''))[:120]}")
 
+    # ---------- Step 5：换取 PC 会话（XML）----------
     r = s.get(API_URL + "/getSessionForPC.action", params={
         "appId": APP_ID, "clientType": "TELEPC", "version": "6.2",
         "channelId": "web_cloud.189.cn", "rand": str(int(time.time() * 1000)),
@@ -143,8 +176,9 @@ def login(username, password):
     }, timeout=TIMEOUT, allow_redirects=True)
     m = re.search(r"<sessionKey>([^<]+)</sessionKey>", r.text)
     if not m:
-        raise LoginError("未取到 sessionKey")
+        raise LoginError(f"未取到 sessionKey，响应前300字：{r.text[:300]}")
     s.cloud189_session_key = m.group(1)
+    debug(f"Step5 sessionKey={s.cloud189_session_key[:16]}...")
     return s
 
 
@@ -156,7 +190,7 @@ def do_checkin(s):
             "clientType": "TELEANDROID", "version": "9.0.6", "model": "KB2000",
         }, headers={"Referer": WEB_URL + "/web/main/"}, timeout=TIMEOUT), "签到")
         if "netdiskBonus" not in d or "isSign" not in d:
-            raise LoginError("签到响应无效")
+            raise LoginError(f"签到响应无效：{str(d)[:200]}")
         if d["isSign"] is False or d["isSign"] == "false":
             r.update(status="signed", signin=f"签到成功，获得 {d['netdiskBonus']}M 空间")
         else:
@@ -185,7 +219,7 @@ def do_draw(s):
                 if "errorCode" in d and d["errorCode"]:
                     item.update(status="no_chance", msg=f"未中奖/次数不足({d.get('errorCode')})")
                 else:
-                    item.update(status="won", msg=f"🎉 抽中 {d.get('prizeName', '未知')}")
+                    item.update(status="won", msg=f"抽中 {d.get('prizeName', '未知')}")
                 break
             except Exception as e:
                 item["msg"] = f"异常：{type(e).__name__}"
@@ -209,7 +243,7 @@ def load_accounts():
 
 
 def wecom_url(key):
-    """QYWX_KEY 是 webhook 里的 key 值，拼成完整 URL"""
+    """QYWX_KEY 可以是纯 key，也可以是完整 URL"""
     key = (key or "").strip()
     if not key:
         return None
@@ -219,12 +253,15 @@ def wecom_url(key):
 
 
 def push_wecom(webhook, content):
+    """text 纯文本推送，避免 markdown 被渲染成链接"""
     if not webhook:
         log("企业微信 webhook 未配置，跳过推送")
         return
     try:
-        r = requests.post(webhook, json={"msgtype": "markdown",
-                            "markdown": {"content": content}}, timeout=15)
+        r = requests.post(webhook, json={
+            "msgtype": "text",
+            "text": {"content": content},
+        }, timeout=15)
         ok = r.status_code == 200 and r.json().get("errcode") == 0
         log("企业微信推送：" + ("成功" if ok else f"失败 {r.text[:100]}"))
     except Exception as e:
@@ -237,42 +274,47 @@ def mask(u):
 
 def main():
     start = datetime.now()
-    log(f"# 天翼云盘自动签到抽奖 ｜ 启动：{start:%Y-%m-%d %H:%M:%S}")
+    log(f"天翼云盘签到抽奖 ｜ 启动：{start:%Y-%m-%d %H:%M:%S}")
     accounts = load_accounts()
-    log(f"- 账户数量：{len(accounts)}")
+    log(f"账户数量：{len(accounts)}")
     webhook = wecom_url(os.getenv("QYWX_KEY"))
 
-    results, report = [], [f"## 天翼云盘签到抽奖报告\n> {start:%Y-%m-%d %H:%M:%S}"]
+    results, blocks = [], []
     for i, acc in enumerate(accounts, 1):
-        log(f"\n## 账户{i} {mask(acc['username'])}")
+        log(f"\n账户{i} {mask(acc['username'])}")
         s, out = None, {"username": mask(acc["username"]), "signin": "", "status": "failed", "draws": []}
         try:
             s = login(acc["username"], acc["password"])
             ck = do_checkin(s)
             out.update(status=ck["status"], signin=ck["signin"] or ck["error"])
-            log(f"- 签到：{ck['signin'] or ck['error']}")
+            log(f"  签到：{ck['signin'] or ck['error']}")
             draws = do_draw(s)
             out["draws"] = draws
             for j, d in enumerate(draws, 1):
-                log(f"- 抽奖{j} [{d['task']}]：{d['msg']}")
+                log(f"  抽奖{j} [{d['task']}]：{d['msg']}")
         except Exception as e:
             out["signin"] = f"登录失败：{type(e).__name__}"
-            log(f"- {out['signin']}")
+            log(f"  {out['signin']}")
         finally:
             if s:
                 s.close()
         results.append(out)
-        report.append(f"### {out['username']}\n- 签到：{out['signin']}")
+        line = [f"账户{i} {out['username']}", f"签到：{out['signin']}"]
         for j, d in enumerate(out["draws"], 1):
-            report.append(f"- 抽奖{j} [{d['task']}]：{d['msg']}")
+            line.append(f"抽奖{j} [{d['task']}]：{d['msg']}")
+        blocks.append("\n".join(line))
 
     sc = sum(1 for r in results if r["status"] == "signed")
     al = sum(1 for r in results if r["status"] == "already_signed")
     fl = sum(1 for r in results if r["status"] == "failed")
     won = sum(1 for r in results for d in r["draws"] if d["status"] == "won")
     cost = (datetime.now() - start).total_seconds()
-    report.insert(1, f"> 🎉 签到 {sc} · ✅ 已签 {al} · ❌ 失败 {fl} · 🎁 中奖 {won} ｜ ⏱ {cost:.1f}s")
-    push_wecom(webhook, "\n\n".join(report))
+
+    header = (f"天翼云盘签到抽奖报告\n"
+              f"执行时间：{start:%Y-%m-%d %H:%M:%S}\n"
+              f"签到 {sc} · 已签 {al} · 失败 {fl} · 中奖 {won} · 耗时 {cost:.1f}s")
+    content = header + "\n\n" + "\n\n".join(blocks)
+    push_wecom(webhook, content)
     log(f"\n完成：{cost:.1f}s")
 
 
