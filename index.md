@@ -2,32 +2,22 @@
 
 [![签到状态](https://github.com/lianxia2020/189pan/actions/workflows/main.yml/badge.svg)](https://github.com/lianxia2020/189pan/actions/workflows/main.yml) [![项目主页](https://img.shields.io/badge/GitHub-项目主页-blue?logo=github)](https://github.com/lianxia2020/189pan)
 
-**最后更新:** 2026-10-10 09:28:53 CST
+**最后更新:** 2026-10-10 10:56:07 CST
 
 ## 快速导航
 
 - 🔄 [查看Action运行记录](https://github.com/lianxia2020/189pan/actions)
-- 📋 [查看最新运行](https://github.com/lianxia2020/189pan/actions/runs/38013317977)
+- 📋 [查看最新运行](https://github.com/lianxia2020/189pan/actions/runs/38018757234)
 - 🏠 [返回项目主页](https://github.com/lianxia2020/189pan)
 - ⚙️ [手动触发签到](https://github.com/lianxia2020/189pan/actions/workflows/main.yml)
 
 ## 签到详情
 
-# 天翼云盘自动签到抽奖程序
+# 天翼云盘自动签到抽奖 ｜ 启动：2026-10-10 10:56:07
+- 账户数量：1
 
-## 执行概览
-- **启动时间**: 2026-10-10 09:28:53
-- **账户数量**: 1 个
+## 账户1 159***32
+- 登录失败：IndexError
+企业微信 webhook 未配置，跳过推送
 
-## 账户1
-没有找到登录链接
-### 执行结果
-- **登录状态**: 登录失败
-- **签到结果**: 
-
----
-## 执行统计
-- **结束时间**: 2026-10-10 09:28:56
-- **运行时长**: 2.97 秒
-
-✅ **所有账户处理完成！**
+完成：6.1s
