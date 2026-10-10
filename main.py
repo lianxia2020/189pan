@@ -1,8 +1,3 @@
-"""
-天翼云盘自动签到 + 抽奖（GitHub Actions 版）
-企微推送：text 纯文本
-Secrets：TYYP_USERNAME（& 分隔多账号）TYYP_PSW（顺序对应）QYWX_KEY（webhook 的 key 值）
-"""
 import time
 import re
 import os
@@ -19,8 +14,6 @@ DRAW_TASKS = [
     ("TASK_SIGNIN_PHOTOS", "相册签到抽奖"),
     ("TASK_2022_FLDFS_KJ", "福利大放送抽奖"),
 ]
-BI_RM = list("0123456789abcdefghijklmnopqrstuvwxyz")
-B64MAP = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 WEB_URL  = "https://cloud.189.cn"
 AUTH_URL = "https://open.e.189.cn"
 API_URL  = "https://api.cloud.189.cn"
@@ -40,38 +33,30 @@ def debug(msg):
         print(f"[DEBUG] {msg}", flush=True)
 
 
-def int2char(a):
-    return BI_RM[a]
-
-
-def b64tohex(a):
-    d, e, c = "", 0, 0
-    for ch in a:
-        if ch == "=":
-            continue
-        v = B64MAP.index(ch)
-        if e == 0:
-            e, c = 1, 3 & v
-            d += int2char(v >> 2)
-        elif e == 1:
-            e, c = 2, 15 & v
-            d += int2char(c << 2 | v >> 4)
-        elif e == 2:
-            e = 3
-            d += int2char(c) + int2char(v >> 2)
-            c = 3 & v
-        else:
-            e = 0
-            d += int2char(c << 2 | v >> 4) + int2char(15 & v)
-    if e == 1:
-        d += int2char(c << 2)
-    return d
-
-
 def rsa_encode(pubkey_b64, string):
+    """
+    RSA 公钥加密。
+    使用标准 base64.b64decode 转字节再 hex()，规避自定义 b64tohex 越界问题；
+    明文超过单次上限时按块加密（1024 位密钥上限约 117 字节）。
+    """
     pem = f"-----BEGIN PUBLIC KEY-----\n{pubkey_b64}\n-----END PUBLIC KEY-----"
     pubkey = rsa.PublicKey.load_pkcs1_openssl_pem(pem.encode())
-    return b64tohex(base64.b64encode(rsa.encrypt(string.encode(), pubkey)).decode())
+    plaintext = string.encode()
+    max_len = pubkey.n.bit_length() // 8 - 11  # PKCS#1 v1.5 需预留 11 字节
+    chunks = [plaintext[i:i + max_len] for i in range(0, len(plaintext), max_len)]
+    out = b"".join(rsa.encrypt(c, pubkey) for c in chunks)
+    return out.hex()
+
+
+def rsa_encode_with_prefix(pubkey_b64, prefix, string):
+    """
+    189 的 pre 前缀约定：NRP 加密时前缀为 'NRP'（去掉花括号），
+    把前缀 hex 拼到密文 hex 前面。
+    """
+    raw = prefix.strip("{}") if prefix else ""
+    if raw:
+        return raw.encode().hex() + rsa_encode(pubkey_b64, string)
+    return rsa_encode(pubkey_b64, string)
 
 
 class LoginError(Exception):
@@ -139,25 +124,21 @@ def login(username, password):
 
     if not isinstance(pubkey, str) or not pubkey:
         raise LoginError(f"pubKey 异常：type={type(pubkey).__name__}")
-    if not isinstance(pre, str):
-        debug("pre 非字符串，降级为空串")
-        pre = ""
 
     try:
-        eu = pre + rsa_encode(pubkey, username)
-        ep = pre + rsa_encode(pubkey, password)
+        eu = rsa_encode_with_prefix(pubkey, pre, username)
+        ep = rsa_encode_with_prefix(pubkey, pre, password)
     except Exception as e:
         raise LoginError(f"RSA 加密失败：{type(e).__name__}: {e}")
-    debug(f"Step2 加密完成 userName长度={len(eu)} password长度={len(ep)}")
+    debug(f"Step2 eu长度={len(eu)} ep长度={len(ep)}")
 
     h = {"Referer": AUTH_URL + "/", "lt": fields["lt"], "REQID": fields["reqId"]}
 
     # ---------- Step 3：验证码检查 ----------
     rc = s.post(AUTH_URL + "/api/logbox/oauth2/needcaptcha.do", headers=h, data={
         "appKey": APP_ID, "accountType": "02", "userName": eu}, timeout=TIMEOUT)
-    debug(f"Step3 状态码={rc.status_code} body={rc.text.strip()!r}")   # ★ 先看真实返回
+    debug(f"Step3 状态码={rc.status_code} body={rc.text.strip()!r}")
     if rc.status_code != 200 or rc.text.strip() != "0":
-        # ★ 只抛一次，且带完整信息
         raise LoginError(f"验证码检查异常：HTTP {rc.status_code}, body={rc.text[:120]!r}")
 
     # ---------- Step 4：登录提交 ----------
