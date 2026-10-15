@@ -62,101 +62,240 @@ def _json(r, stage):
         raise LoginError(f"{stage}：响应非 JSON，前300字：{r.text[:300]}")
 
 
+
 def login(username, password):
     if not username or not password:
         raise LoginError("账号或密码为空")
+
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/87.0.4280.88 Safari/537.36"
+        ),
         "Accept": "*/*",
     })
+
     debug("登录开始")
 
-    r = s.get(WEB_URL + "/api/portal/unifyLoginForPC.action", params={
-        "appId": APP_ID, "clientType": "10020", "returnURL": RETURN_URL,
-        "timeStamp": str(int(time.time() * 1000)),
-    }, timeout=TIMEOUT, allow_redirects=True)
-    debug(f"Step1 状态码={r.status_code} 最终URL={r.url[:100]}")
-    if r.status_code != 200:
-        raise LoginError(f"登录页 HTTP {r.status_code}")
-    if "unifyAccountLogin" not in r.url:
-        raise LoginError(f"登录页未跳转，落点={r.url[:100]}")
-
-    fields, patterns = {}, {
-        "captchaToken": r"['\"]captchaToken['\"]\s+value=['\"]([^'\"]+)['\"]",
-        "lt":           r"\blt\s*=\s*['\"]([^'\"]+)['\"]",
-        "paramId":      r"\bparamId\s*=\s*['\"]([^'\"]+)['\"]",
-        "reqId":        r"\breqId\s*=\s*['\"]([^'\"]+)['\"]",
-    }
-    for name, pat in patterns.items():
-        m = re.search(pat, r.text)
-        if not m:
-            raise LoginError(f"登录页缺少字段[{name}]")
-        fields[name] = m.group(1)
-        debug(f"  {name} = {fields[name][:20]}...")
-
-    conf = _json(s.post(AUTH_URL + "/api/logbox/config/encryptConf.do",
-                        data={"appId": APP_ID}, timeout=TIMEOUT), "加密配置")
-    debug(f"Step2 响应: {json.dumps(conf, ensure_ascii=False)[:400]}")
-
-    enc = conf.get("data") if isinstance(conf.get("data"), dict) else {}
-    if not enc:
-        enc = conf
-
-    pubkey = enc.get("pubKey")
-    pre = enc.get("pre")
-    debug(f"Step2 pubKey存在={'Y' if pubkey else 'N'} pre={repr(pre)}")
-
-    if not isinstance(pubkey, str) or not pubkey:
-        raise LoginError(f"pubKey 异常：type={type(pubkey).__name__}")
-
-    debug(f"Step2 手机号b64={base64.urlsafe_b64encode(username.encode()).rstrip(b'=').decode()}")
-
     try:
-        eu = encode_for_login(pubkey, pre, username)
-        ep = encode_for_login(pubkey, pre, password)
-    except Exception as e:
-        raise LoginError(f"RSA 加密失败：{type(e).__name__}: {e}")
-    debug(f"Step2 eu前缀hex={eu[:12]!r} eu长度={len(eu)} ep长度={len(ep)}")
+        # Step 1：先获取 RSA 公钥和 pre
+        conf = _json(
+            s.post(
+                AUTH_URL + "/api/logbox/config/encryptConf.do",
+                timeout=TIMEOUT,
+            ),
+            "获取加密配置",
+        )
 
-    h = {
-        "Referer": AUTH_URL + "/", "Origin": AUTH_URL,
-        "lt": fields["lt"], "REQID": fields["reqId"],
-        "Accept": "application/json;charset=UTF-8",
-    }
+        enc = conf.get("data")
+        if not isinstance(enc, dict):
+            enc = conf
 
-    rc = s.post(AUTH_URL + "/api/logbox/oauth2/needcaptcha.do", headers=h, data={
-        "appKey": APP_ID, "accountType": ACCOUNT_TYPE, "userName": eu}, timeout=TIMEOUT)
-    debug(f"Step3 状态码={rc.status_code} body={rc.text.strip()!r}")
-    if rc.status_code != 200 or rc.text.strip() != "0":
-        raise LoginError(f"验证码检查异常：HTTP {rc.status_code}, body={rc.text[:120]!r}")
+        pubkey = enc.get("pubKey")
+        pre = enc.get("pre", "")
 
-    r4 = s.post(AUTH_URL + "/api/logbox/oauth2/loginSubmit.do", headers=h, data={
-        "appKey": APP_ID, "accountType": ACCOUNT_TYPE, "userName": eu, "password": ep,
-        "validateCode": "", "captchaToken": fields["captchaToken"], "dynamicCheck": "FALSE",
-        "clientType": "1", "cb_SaveName": "3", "isOauth2": "false",
-        "returnUrl": RETURN_URL, "paramId": fields["paramId"],
-        "province": "", "rnd": str(int(time.time() * 1000)),
-    }, timeout=TIMEOUT)
-    debug(f"Step4 状态码={r4.status_code} 响应前400={r4.text[:400]!r}")
-    d = _json(r4, "密码登录")
-    debug(f"Step4 result={d.get('result')} 有toUrl={'toUrl' in d}")
-    if d.get("result") not in (0, "0") or not d.get("toUrl"):
-        raise LoginError(f"登录被拒绝（{d.get('result')}）：{str(d.get('msg', ''))[:120]}")
+        if not isinstance(pubkey, str) or not pubkey:
+            raise LoginError("加密配置未返回有效 pubKey")
 
-    r5 = s.get(API_URL + "/getSessionForPC.action", params={
-        "appId": APP_ID, "clientType": "TELEPC", "version": "6.2",
-        "channelId": "web_cloud.189.cn", "rand": str(int(time.time() * 1000)),
-        "redirectURL": d["toUrl"],
-    }, timeout=TIMEOUT, allow_redirects=True)
-    debug(f"Step5 状态码={r5.status_code} 响应前200={r5.text[:200]!r}")
-    m = re.search(r"<sessionKey>([^<]+)</sessionKey>", r5.text)
-    if not m:
-        raise LoginError(f"未取到 sessionKey，响应前300字：{r5.text[:300]}")
-    s.cloud189_session_key = m.group(1)
-    debug(f"Step5 sessionKey={s.cloud189_session_key[:16]}...")
-    return s
+        if not isinstance(pre, str):
+            raise LoginError("加密配置中的 pre 格式异常")
+
+        debug(f"Step1 公钥获取成功，pre={pre!r}")
+
+        # Step 2：获取登录页面动态参数
+        page = s.get(
+            WEB_URL + "/api/portal/unifyLoginForPC.action",
+            params={
+                "appId": APP_ID,
+                "clientType": "10020",
+                "returnURL": RETURN_URL,
+                "timeStamp": str(int(time.time() * 1000)),
+            },
+            timeout=TIMEOUT,
+            allow_redirects=True,
+        )
+
+        debug(
+            f"Step2 状态码={page.status_code} "
+            f"登录页参数解析开始"
+        )
+
+        if page.status_code != 200:
+            raise LoginError(f"登录页面 HTTP {page.status_code}")
+
+        patterns = {
+            "captchaToken": [
+                r"""['"]captchaToken['"]\s+value=['"]([^'"]+)['"]""",
+                r"""name=['"]captchaToken['"][^>]*value=['"]([^'"]+)['"]""",
+            ],
+            "lt": [
+                r"""\blt\s*=\s*['"]([^'"]+)['"]""",
+            ],
+            "paramId": [
+                r"""\bparamId\s*=\s*['"]([^'"]+)['"]""",
+            ],
+            "reqId": [
+                r"""\breqId\s*=\s*['"]([^'"]+)['"]""",
+            ],
+        }
+
+        fields = {}
+        for name, candidates in patterns.items():
+            for pattern in candidates:
+                match = re.search(pattern, page.text, re.S)
+                if match:
+                    fields[name] = match.group(1)
+                    break
+
+            if name not in fields:
+                raise LoginError(f"登录页面缺少动态参数：{name}")
+
+        debug("Step2 captchaToken/lt/paramId/reqId 获取成功")
+
+        # Step 3：按参考代码加密原始账号和密码
+        # 不做 Base64，不将 pre 转成 hex
+        pem = (
+            "-----BEGIN PUBLIC KEY-----\n"
+            + pubkey
+            + "\n-----END PUBLIC KEY-----"
+        )
+        public_key = rsa.PublicKey.load_pkcs1_openssl_pem(
+            pem.encode("ascii")
+        )
+
+        username_cipher = rsa.encrypt(
+            username.strip().encode("utf-8"),
+            public_key,
+        ).hex()
+
+        password_cipher = rsa.encrypt(
+            password.encode("utf-8"),
+            public_key,
+        ).hex()
+
+        encrypted_username = pre + username_cipher
+        encrypted_password = pre + password_cipher
+
+        debug(
+            f"Step3 加密完成："
+            f"账号密文长度={len(encrypted_username)}，"
+            f"密码密文长度={len(encrypted_password)}"
+        )
+
+        # Step 4：提交登录
+        # 与上传的旧版参考代码保持一致，AccountType 使用 02
+        headers = {
+            "Referer": AUTH_URL + "/",
+            "Origin": AUTH_URL,
+            "lt": fields["lt"],
+            "REQID": fields["reqId"],
+            "Accept": "application/json;charset=UTF-8",
+        }
+
+        login_data = {
+            "appKey": APP_ID,
+            "accountType": "02",
+            "validateCode": "",
+            "captchaToken": fields["captchaToken"],
+            "dynamicCheck": "FALSE",
+            "clientType": "1",
+            "cb_SaveName": "3",
+            "isOauth2": "false",
+            "returnUrl": RETURN_URL,
+            "paramId": fields["paramId"],
+            "userName": encrypted_username,
+            "password": encrypted_password,
+        }
+
+        response = s.post(
+            AUTH_URL + "/api/logbox/oauth2/loginSubmit.do",
+            headers=headers,
+            data=login_data,
+            timeout=TIMEOUT,
+        )
+
+        debug(f"Step4 状态码={response.status_code}")
+
+        login_result = _json(response, "提交登录")
+        result_code = login_result.get("result")
+        message = str(login_result.get("msg", ""))
+
+        debug(
+            f"Step4 result={result_code}, "
+            f"msg={message[:100]!r}"
+        )
+
+        if str(result_code) != "0":
+            raise LoginError(
+                f"登录被拒绝（{result_code}）：{message[:120]}"
+            )
+
+        redirect_url = login_result.get("toUrl")
+        if not redirect_url:
+            raise LoginError("登录返回成功，但缺少 toUrl")
+
+        # Step 5：获取云盘 session
+        session_response = s.get(
+            API_URL + "/getSessionForPC.action",
+            params={
+                "appId": APP_ID,
+                "clientType": "TELEPC",
+                "version": "6.2",
+                "channelId": "web_cloud.189.cn",
+                "rand": str(int(time.time() * 1000)),
+                "redirectURL": redirect_url,
+            },
+            timeout=TIMEOUT,
+            allow_redirects=True,
+        )
+
+        debug(
+            f"Step5 状态码={session_response.status_code}"
+        )
+
+        if session_response.status_code != 200:
+            raise LoginError(
+                f"获取 session HTTP {session_response.status_code}"
+            )
+
+        session_key = ""
+
+        # 兼容 JSON 响应
+        try:
+            session_json = session_response.json()
+            session_key = (
+                session_json.get("sessionKey", "")
+                or session_json.get("data", {}).get("sessionKey", "")
+                if isinstance(session_json, dict)
+                else ""
+            )
+        except (ValueError, TypeError):
+            pass
+
+        # 兼容 XML 响应
+        if not session_key:
+            match = re.search(
+                r"<sessionKey>([^<]+)</sessionKey>",
+                session_response.text,
+            )
+            if match:
+                session_key = match.group(1)
+
+        if not session_key:
+            raise LoginError(
+                "登录提交成功，但响应中未找到 sessionKey"
+            )
+
+        s.cloud189_session_key = session_key
+        debug("Step5 获取 sessionKey 成功")
+        return s
+
+    except Exception:
+        s.close()
+        raise
+
 
 
 def do_checkin(s):
