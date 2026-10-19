@@ -298,22 +298,77 @@ def login(username, password):
 
 
 
+
 def do_checkin(s):
     r = {"signin": "", "status": "failed", "error": None}
-    try:
-        d = _json(s.get(WEB_URL + "/mkt/userSign.action", params={
-            "sessionKey": s.cloud189_session_key, "rand": str(int(time.time() * 1000)),
-            "clientType": "TELEANDROID", "version": "9.0.6", "model": "KB2000",
-        }, headers={"Referer": WEB_URL + "/web/main/"}, timeout=TIMEOUT), "签到")
-        if "netdiskBonus" not in d or "isSign" not in d:
-            raise LoginError(f"签到响应无效：{str(d)[:200]}")
-        if d["isSign"] is False or d["isSign"] == "false":
-            r.update(status="signed", signin=f"签到成功，获得 {d['netdiskBonus']}M 空间")
-        else:
-            r.update(status="already_signed", signin="今日已签到，本次未重复领取")
-    except Exception as e:
-        r["error"] = f"签到失败：{type(e).__name__}: {e}"
+
+    url = WEB_URL + "/mkt/userSign.action"
+    params = {
+        "sessionKey": s.cloud189_session_key,
+        "rand": str(int(time.time() * 1000)),
+        "clientType": "TELEANDROID",
+        "version": "9.0.6",
+        "model": "KB2000",
+    }
+    headers = {
+        "Referer": WEB_URL + "/web/main/",
+        "Connection": "close",
+    }
+
+    # 最多尝试 3 次，只对网络连接异常进行重试
+    for attempt in range(1, 4):
+        try:
+            response = s.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=TIMEOUT,
+            )
+
+            d = _json(response, "签到")
+
+            if "netdiskBonus" not in d or "isSign" not in d:
+                raise LoginError(
+                    f"签到响应无效：{str(d)[:200]}"
+                )
+
+            if d["isSign"] is False or d["isSign"] == "false":
+                r.update(
+                    status="signed",
+                    signin=f"签到成功，获得 {d['netdiskBonus']}M 空间",
+                )
+            else:
+                r.update(
+                    status="already_signed",
+                    signin="今日已签到，本次未重复领取",
+                )
+
+            return r
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            debug(
+                f"签到网络异常，第 {attempt}/3 次："
+                f"{type(e).__name__}: {e}"
+            )
+
+            if attempt < 3:
+                time.sleep(attempt * 2)
+            else:
+                r["error"] = (
+                    f"签到失败：连续 3 次网络请求异常，"
+                    f"{type(e).__name__}: {e}"
+                )
+                return r
+
+        except Exception as e:
+            r["error"] = f"签到失败：{type(e).__name__}: {e}"
+            return r
+
     return r
+
 
 
 def do_draw(s):
