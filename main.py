@@ -438,7 +438,8 @@ def push_wecom(webhook, content):
 
 
 def mask(u):
-    return u[:3] + "***" + u[-2:] if len(u) > 5 else "***"
+    # return u[:3] + "***" + u[-2:] if len(u) > 5 else "***"
+    return u[0] + "*" * (len(u) - 1) if u else ""
 
 
 def main():
